@@ -19,7 +19,7 @@ namespace Orleans.Runtime
     /// <summary>
     /// <see cref="IClusterManifestProvider"/> implementation for external clients.
     /// </summary>
-    internal class ClientClusterManifestProvider : IClusterManifestProvider, IAsyncDisposable, IDisposable
+    internal partial class ClientClusterManifestProvider : IClusterManifestProvider, IAsyncDisposable, IDisposable
     {
         private readonly TaskCompletionSource<bool> _initialized = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
         private readonly ILogger<ClientClusterManifestProvider> _logger;
@@ -28,7 +28,7 @@ namespace Orleans.Runtime
         private readonly LocalClientDetails _localClientDetails;
         private readonly GatewayManager _gatewayManager;
         private readonly AsyncEnumerable<ClusterManifest> _updates;
-        private readonly CancellationTokenSource _cancellation = new CancellationTokenSource();
+        private readonly CancellationTokenSource _shutdownCts = new CancellationTokenSource();
         private ClusterManifest _current;
         private Task? _runTask;
 
@@ -81,20 +81,20 @@ namespace Orleans.Runtime
         {
             try
             {
-                _cancellation.Cancel();
+                _shutdownCts.Cancel();
 
-                if (_runTask is { IsCompleted: false } _task)
+                if (_runTask is { } task)
                 {
-                    await _task.WaitAsync(cancellationToken);
+                    await task.WaitAsync(cancellationToken);
                 }
             }
-            catch (OperationCanceledException)
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
             {
-                _logger.LogInformation("Graceful shutdown of cluster manifest provider was canceled.");
+                LogGracefulShutdownCanceled(_logger);
             }
             catch (Exception exception)
             {
-                _logger.LogError(exception, "Error stopping cluster manifest provider.");
+                LogStoppingClusterManifestProvider(_logger, exception);
             }
         }
 
@@ -103,12 +103,11 @@ namespace Orleans.Runtime
             try
             {
                 var grainFactory = _services.GetRequiredService<IInternalGrainFactory>();
-                var cancellationTask = _cancellation.Token.WhenCancelled();
                 SiloAddress? gateway = null;
                 IClusterManifestSystemTarget? provider = null;
                 var minorVersion = 0;
                 var gatewayVersion = MajorMinorVersion.MinValue;
-                while (!_cancellation.IsCancellationRequested)
+                while (!_shutdownCts.IsCancellationRequested)
                 {
                     // Select a new gateway if the current one is not available.
                     // This could be caused by a temporary issue or a permanent gateway failure.
@@ -117,7 +116,7 @@ namespace Orleans.Runtime
                         gateway = _gatewayManager.GetLiveGateway();
                         if (gateway is null)
                         {
-                            await Task.Delay(StandardExtensions.Min(_typeManagementOptions.TypeMapRefreshInterval, TimeSpan.FromMilliseconds(500)));
+                            await Task.Delay(StandardExtensions.Min(_typeManagementOptions.TypeMapRefreshInterval, TimeSpan.FromMilliseconds(500)), _shutdownCts.Token);
                             continue;
                         }
 
@@ -135,19 +134,11 @@ namespace Orleans.Runtime
 
                     try
                     {
-                        var refreshTask = GetClusterManifestUpdate(provider, gatewayVersion);
-                        var task = await Task.WhenAny(cancellationTask, refreshTask).ConfigureAwait(false);
-
-                        if (ReferenceEquals(task, cancellationTask))
-                        {
-                            return;
-                        }
-
-                        var updateResult = await refreshTask;
+                        var updateResult = await GetClusterManifestUpdate(provider, gatewayVersion).WaitAsync(_shutdownCts.Token);
                         if (updateResult is null)
                         {
                             // There was no newer cluster manifest, so wait for the next refresh interval and try again.
-                            await Task.WhenAny(cancellationTask, Task.Delay(_typeManagementOptions.TypeMapRefreshInterval));
+                            await Task.Delay(_typeManagementOptions.TypeMapRefreshInterval, _shutdownCts.Token);
                             continue;
                         }
 
@@ -176,23 +167,24 @@ namespace Orleans.Runtime
                         var updatedManifest = new ClusterManifest(new MajorMinorVersion(gatewayVersion.Major, ++minorVersion), siloManifests);
                         if (!_updates.TryPublish(updatedManifest))
                         {
-                            await Task.Delay(StandardExtensions.Min(_typeManagementOptions.TypeMapRefreshInterval, TimeSpan.FromMilliseconds(500)));
+                            await Task.Delay(StandardExtensions.Min(_typeManagementOptions.TypeMapRefreshInterval, TimeSpan.FromMilliseconds(500)), _shutdownCts.Token);
                             continue;
                         }
 
                         _initialized.TrySetResult(true);
 
-                        if (_logger.IsEnabled(LogLevel.Debug))
-                        {
-                            _logger.LogDebug("Refreshed cluster manifest");
-                        }
+                        LogRefreshedClusterManifest(_logger);
 
-                        await Task.WhenAny(cancellationTask, Task.Delay(_typeManagementOptions.TypeMapRefreshInterval));
+                        await Task.Delay(_typeManagementOptions.TypeMapRefreshInterval, _shutdownCts.Token);
+                    }
+                    catch (OperationCanceledException) when (_shutdownCts.IsCancellationRequested)
+                    {
+                        // Ignore during shutdown.
                     }
                     catch (Exception exception)
                     {
-                        _logger.LogWarning(exception, "Error trying to get cluster manifest from gateway {Gateway}", gateway);
-                        await Task.Delay(StandardExtensions.Min(_typeManagementOptions.TypeMapRefreshInterval, TimeSpan.FromSeconds(5)));
+                        LogErrorTryingToGetClusterManifest(_logger, exception, gateway);
+                        await Task.Delay(StandardExtensions.Min(_typeManagementOptions.TypeMapRefreshInterval, TimeSpan.FromSeconds(5)), _shutdownCts.Token).SuppressThrowing();
 
                         // Reset the gateway so that another will be selected on the next iteration.
                         gateway = null;
@@ -203,10 +195,7 @@ namespace Orleans.Runtime
             {
                 _initialized.TrySetResult(false);
 
-                if (_logger.IsEnabled(LogLevel.Debug))
-                {
-                    _logger.LogDebug("Stopped refreshing cluster manifest");
-                }
+                LogStoppedRefreshingClusterManifest(_logger);
             }
         }
 
@@ -220,7 +209,7 @@ namespace Orleans.Runtime
             }
             catch (Exception exception)
             {
-                _logger.LogWarning(exception, "Failed to fetch cluster manifest update from {Provider}.", provider);
+                LogFailedToFetchClusterManifestUpdate(_logger, exception, provider);
 
                 // If the provider does not support the new API, fall back to the old one.
                 var manifest = await provider.GetClusterManifest();
@@ -230,16 +219,60 @@ namespace Orleans.Runtime
         }
 
         /// <inheritdoc />
-        public ValueTask DisposeAsync()
+        public async ValueTask DisposeAsync()
         {
-            _cancellation.Cancel();
-            return _runTask is Task task ? new ValueTask(task) : default;
+            if (_shutdownCts.IsCancellationRequested)
+            {
+                return;
+            }
+
+            _shutdownCts.Cancel();
+            if (_runTask is Task task)
+            {
+                await task.SuppressThrowing();
+            }
         }
 
         /// <inheritdoc />
         public void Dispose()
         {
-            _cancellation.Cancel();
+            _shutdownCts.Cancel();
         }
+
+        [LoggerMessage(
+            Level = LogLevel.Information,
+            Message = "Graceful shutdown of cluster manifest provider was canceled."
+        )]
+        private static partial void LogGracefulShutdownCanceled(ILogger logger);
+
+        [LoggerMessage(
+            Level = LogLevel.Error,
+            Message = "Error stopping cluster manifest provider."
+        )]
+        private static partial void LogStoppingClusterManifestProvider(ILogger logger, Exception exception);
+
+        [LoggerMessage(
+            Level = LogLevel.Debug,
+            Message = "Refreshed cluster manifest."
+        )]
+        private static partial void LogRefreshedClusterManifest(ILogger logger);
+
+        [LoggerMessage(
+            Level = LogLevel.Warning,
+            Message = "Error trying to get cluster manifest from gateway '{Gateway}'."
+        )]
+        private static partial void LogErrorTryingToGetClusterManifest(ILogger logger, Exception exception, SiloAddress gateway);
+
+        [LoggerMessage(
+            Level = LogLevel.Debug,
+            Message = "Stopped refreshing cluster manifest."
+        )]
+        private static partial void LogStoppedRefreshingClusterManifest(ILogger logger);
+
+        [LoggerMessage(
+            Level = LogLevel.Warning,
+            Message = "Failed to fetch cluster manifest update from '{Provider}'."
+        )]
+        private static partial void LogFailedToFetchClusterManifestUpdate(ILogger logger, Exception exception, IClusterManifestSystemTarget provider);
     }
 }

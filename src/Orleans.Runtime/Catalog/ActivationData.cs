@@ -26,7 +26,17 @@ namespace Orleans.Runtime;
 /// MUST lock this object for any concurrent access
 /// Consider: compartmentalize by usage, e.g., using separate interfaces for data for catalog, etc.
 /// </summary>
-internal sealed class ActivationData : IGrainContext, ICollectibleGrainContext, IGrainExtensionBinder, IActivationWorkingSetMember, IGrainTimerRegistry, IGrainManagementExtension, ICallChainReentrantGrainContext, IAsyncDisposable, IDisposable
+internal sealed class ActivationData :
+    IGrainContext,
+    ICollectibleGrainContext,
+    IGrainExtensionBinder,
+    IActivationWorkingSetMember,
+    IGrainTimerRegistry,
+    IGrainManagementExtension,
+    IGrainCallCancellationExtension,
+    ICallChainReentrantGrainContext,
+    IAsyncDisposable,
+    IDisposable
 {
     private const string GrainAddressMigrationContextKey = "sys.addr";
     private readonly GrainTypeSharedContext _shared;
@@ -701,7 +711,7 @@ internal sealed class ActivationData : IGrainContext, ICollectibleGrainContext, 
                 }
 
                 var executionTime = _busyDuration.Elapsed;
-                if (executionTime >= slowRunningRequestDuration)
+                if (executionTime >= slowRunningRequestDuration && !message.IsLocalOnly)
                 {
                     GetStatusList(ref diagnostics);
                     if (timeSinceQueued.HasValue)
@@ -722,7 +732,10 @@ internal sealed class ActivationData : IGrainContext, ICollectibleGrainContext, 
             {
                 var message = running.Key;
                 var runDuration = running.Value;
-                if (ReferenceEquals(message, _blockingRequest)) continue;
+                if (ReferenceEquals(message, _blockingRequest) || message.IsLocalOnly)
+                {
+                    continue;
+                }
 
                 // Check how long they've been executing.
                 var executionTime = runDuration.Elapsed;
@@ -744,6 +757,11 @@ internal sealed class ActivationData : IGrainContext, ICollectibleGrainContext, 
             foreach (var pair in _waitingRequests)
             {
                 var message = pair.Message;
+                if (message.IsLocalOnly)
+                {
+                    continue;
+                }
+
                 var queuedTime = pair.QueuedTime.Elapsed;
                 if (queuedTime >= longQueueTimeDuration)
                 {
@@ -835,14 +853,25 @@ internal sealed class ActivationData : IGrainContext, ICollectibleGrainContext, 
         {
         }
 
-        switch (_serviceScope)
+        await DisposeAsync(_serviceScope);
+    }
+
+    private static async ValueTask DisposeAsync(object obj)
+    {
+        try
         {
-            case IAsyncDisposable asyncDisposable:
+            if (obj is IAsyncDisposable asyncDisposable)
+            {
                 await asyncDisposable.DisposeAsync();
-                break;
-            case IDisposable disposable:
+            }
+            else if (obj is IDisposable disposable)
+            {
                 disposable.Dispose();
-                break;
+            }
+        }
+        catch
+        {
+            // Ignore.
         }
     }
 
@@ -1194,7 +1223,7 @@ internal sealed class ActivationData : IGrainContext, ICollectibleGrainContext, 
                 }
                 finally
                 {
-                    (op as IDisposable)?.Dispose();
+                    await DisposeAsync(op);
                 }
             }
         }
@@ -1246,10 +1275,6 @@ internal sealed class ActivationData : IGrainContext, ICollectibleGrainContext, 
         catch (Exception exception)
         {
             _shared.Logger.LogError(exception, "Error while rehydrating activation");
-        }
-        finally
-        {
-            (context as IDisposable)?.Dispose();
         }
     }
 
@@ -1926,6 +1951,94 @@ internal sealed class ActivationData : IGrainContext, ICollectibleGrainContext, 
         return tracker.IsReentrantSectionActive(reentrancyId);
     }
 
+    ValueTask IGrainCallCancellationExtension.CancelRequestAsync(GrainId senderGrainId, CorrelationId messageId)
+    {
+        if (!TryCancelRequest())
+        {
+            // The message being canceled may not have arrived yet, so retry a few times.
+            return RetryCancellationAfterDelay();
+        }
+
+        return ValueTask.CompletedTask;
+
+        async ValueTask RetryCancellationAfterDelay()
+        {
+            var attemptsRemaining = 3;
+            do
+            {
+                await Task.Delay(1_000);
+            } while (!TryCancelRequest() && --attemptsRemaining > 0);
+        }
+
+        bool TryCancelRequest()
+        {
+            Message? message = null;
+            var wasWaiting = false;
+            lock (this)
+            {
+                // Check the running requests.
+                foreach (var candidate in _runningRequests.Keys)
+                {
+                    if (candidate.Id == messageId && candidate.SendingGrain == senderGrainId)
+                    {
+                        message = candidate;
+                        break;
+                    }
+                }
+
+                if (message is null)
+                {
+                    // Check the waiting requests.
+                    for (var i = 0; i < _waitingRequests.Count; i++)
+                    {
+                        var candidate = _waitingRequests[i].Message;
+                        if (candidate.Id == messageId && candidate.SendingGrain == senderGrainId)
+                        {
+                            message = candidate;
+                            _waitingRequests.RemoveAt(i);
+                            wasWaiting = true;
+                            break;
+                        }
+                    }
+                }
+            }
+
+            if (message is not null && message.BodyObject is IInvokable request)
+            {
+                if (TaskScheduler.Current != _workItemGroup.TaskScheduler)
+                {
+                    // Ensure that cancellation callbacks are performed on the grain's scheduler.
+                    _workItemGroup.TaskScheduler.QueueAction(() => CancelRequest(request));
+                }
+                else
+                {
+                    CancelRequest(request);
+                }
+
+                if (wasWaiting)
+                {
+                    _shared.InternalRuntime.RuntimeClient.SendResponse(message, Response.FromException(new OperationCanceledException()));
+                }
+
+                return true;
+            }
+
+            return false;
+        }
+
+        void CancelRequest(IInvokable request)
+        {
+            try
+            {
+                request.TryCancel();
+            }
+            catch (Exception exception)
+            {
+                Shared.Logger.LogWarning(exception, "One or more cancellation callbacks failed.");
+            }
+        }
+    }
+
     #endregion
 
     /// <summary>
@@ -2015,7 +2128,7 @@ internal sealed class ActivationData : IGrainContext, ICollectibleGrainContext, 
         }
     }
 
-    private abstract class Command(CancellationTokenSource cts)
+    private abstract class Command(CancellationTokenSource cts) : IDisposable
     {
         private bool _disposed;
         private readonly CancellationTokenSource _cts = cts;
@@ -2032,11 +2145,20 @@ internal sealed class ActivationData : IGrainContext, ICollectibleGrainContext, 
 
         public virtual void Dispose()
         {
-            lock (this)
+            try
             {
-                _disposed = true;
-                _cts.Dispose();
+                lock (this)
+                {
+                    _disposed = true;
+                    _cts.Dispose();
+                }
             }
+            catch
+            {
+                // Ignore.
+            }
+
+            GC.SuppressFinalize(this);
         }
 
         public sealed class Deactivate(CancellationTokenSource cts, ActivationState previousState) : Command(cts)
@@ -2044,7 +2166,7 @@ internal sealed class ActivationData : IGrainContext, ICollectibleGrainContext, 
             public ActivationState PreviousState { get; } = previousState;
         }
 
-        public sealed class Activate(Dictionary<string, object>? requestContext, CancellationTokenSource cts) : Command(cts), IDisposable
+        public sealed class Activate(Dictionary<string, object>? requestContext, CancellationTokenSource cts) : Command(cts)
         {
             public Dictionary<string, object>? RequestContext { get; } = requestContext;
         }
@@ -2052,6 +2174,12 @@ internal sealed class ActivationData : IGrainContext, ICollectibleGrainContext, 
         public sealed class Rehydrate(IRehydrationContext context) : Command(new())
         {
             public readonly IRehydrationContext Context = context;
+
+            public override void Dispose()
+            {
+                base.Dispose();
+                (Context as IDisposable)?.Dispose();
+            }
         }
 
         public sealed class Delay(TimeSpan duration) : Command(new())
