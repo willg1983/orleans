@@ -18,6 +18,7 @@ namespace Orleans.Runtime
         /// The underlying <see cref="Guid"/>.
         /// </summary>
         [Id(0)]
+        [System.Text.Json.Serialization.JsonInclude]
         public readonly Guid Guid;
 
         /// <summary>
@@ -26,6 +27,7 @@ namespace Orleans.Runtime
         /// <param name="guid">
         /// The underlying <see cref="Guid"/>.
         /// </param>
+        [System.Text.Json.Serialization.JsonConstructor]
         private GuidId(Guid guid)
         {
             this.Guid = guid;
