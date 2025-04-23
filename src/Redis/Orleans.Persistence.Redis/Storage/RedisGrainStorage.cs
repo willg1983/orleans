@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Diagnostics;
 using System.Globalization;
 using System.Linq;
@@ -10,6 +10,7 @@ using Microsoft.Extensions.Options;
 using Orleans.Configuration;
 using Orleans.Persistence.Redis;
 using Orleans.Runtime;
+using Orleans.Serialization.Serializers;
 using Orleans.Storage;
 using StackExchange.Redis;
 using static System.FormattableString;
@@ -19,7 +20,7 @@ namespace Orleans.Persistence
     /// <summary>
     /// Redis-based grain storage provider
     /// </summary>
-    public class RedisGrainStorage : IGrainStorage, ILifecycleParticipant<ISiloLifecycle>
+    public partial class RedisGrainStorage : IGrainStorage, ILifecycleParticipant<ISiloLifecycle>
     {
         private readonly string _serviceId;
         private readonly RedisValue _ttl;
@@ -27,6 +28,7 @@ namespace Orleans.Persistence
         private readonly string _name;
         private readonly ILogger _logger;
         private readonly RedisStorageOptions _options;
+        private readonly IActivatorProvider _activatorProvider;
         private readonly IGrainStorageSerializer _grainStorageSerializer;
         private readonly Func<string, GrainId, RedisKey> _getKeyFunc;
         private IConnectionMultiplexer _connection;
@@ -40,11 +42,13 @@ namespace Orleans.Persistence
             RedisStorageOptions options,
             IGrainStorageSerializer grainStorageSerializer,
             IOptions<ClusterOptions> clusterOptions,
+            IActivatorProvider activatorProvider,
             ILogger<RedisGrainStorage> logger)
         {
             _name = name;
             _logger = logger;
             _options = options;
+            _activatorProvider = activatorProvider;
             _grainStorageSerializer = options.GrainStorageSerializer ?? grainStorageSerializer;
             _serviceId = clusterOptions.Value.ServiceId;
             _ttl = options.EntryExpiry is { } ts ? ts.TotalSeconds.ToString(CultureInfo.InvariantCulture) : "-1";
@@ -61,42 +65,22 @@ namespace Orleans.Persistence
 
         private async Task Init(CancellationToken cancellationToken)
         {
-            var timer = Stopwatch.StartNew();
+            var startTime = Stopwatch.GetTimestamp();
 
             try
             {
-                if (_logger.IsEnabled(LogLevel.Debug))
-                {
-                    _logger.LogDebug(
-                        "RedisGrainStorage {Name} is initializing: ServiceId={ServiceId} DeleteOnClear={DeleteOnClear}",
-                         _name,
-                         _serviceId,
-                         _options.DeleteStateOnClear);
-                }
+                LogDebugInitializing(_name, _serviceId, _options.DeleteStateOnClear);
 
                 _connection = await _options.CreateMultiplexer(_options).ConfigureAwait(false);
                 _db = _connection.GetDatabase();
 
-                if (_logger.IsEnabled(LogLevel.Debug))
-                {
-                    timer.Stop();
-                    _logger.LogDebug(
-                        "Init: Name={Name} ServiceId={ServiceId}, initialized in {ElapsedMilliseconds} ms",
-                        _name,
-                        _serviceId,
-                        timer.Elapsed.TotalMilliseconds.ToString("0.00"));
-                }
+                var elapsed = Stopwatch.GetElapsedTime(startTime);
+                LogDebugInitialized(_name, _serviceId, elapsed.TotalMilliseconds);
             }
             catch (Exception ex)
             {
-                timer.Stop();
-                _logger.LogError(
-                    ex,
-                    "Init: Name={Name} ServiceId={ServiceId}, errored in {ElapsedMilliseconds} ms.",
-                    _name,
-                    _serviceId,
-                    timer.Elapsed.TotalMilliseconds.ToString("0.00"));
-
+                var elapsed = Stopwatch.GetElapsedTime(startTime);
+                LogErrorInitFailed(ex, _name, _serviceId, elapsed.TotalMilliseconds);
                 throw new RedisStorageException(Invariant($"{ex.GetType()}: {ex.Message}"));
             }
         }
@@ -112,33 +96,30 @@ namespace Orleans.Persistence
                 if (hashEntries.Length == 2)
                 {
                     string eTag = hashEntries.Single(static e => e.Name == "etag").Value;
-                    ReadOnlyMemory<byte> data = hashEntries.Single(static e => e.Name == "data").Value;
+                    grainState.ETag = eTag;
 
+                    ReadOnlyMemory<byte> data = hashEntries.Single(static e => e.Name == "data").Value;
                     if (data.Length > 0)
                     {
                         grainState.State = _grainStorageSerializer.Deserialize<T>(data);
+                        grainState.RecordExists = true;
                     }
                     else
                     {
-                        grainState.State = Activator.CreateInstance<T>();
+                        grainState.State = CreateInstance<T>();
+                        grainState.RecordExists = false;
                     }
-
-                    grainState.ETag = eTag;
-                    grainState.RecordExists = true;
                 }
                 else
                 {
                     grainState.ETag = null;
+                    grainState.State = CreateInstance<T>();
                     grainState.RecordExists = false;
                 }
             }
             catch (Exception exception)
             {
-                _logger.LogError(
-                    "Failed to read grain state for {GrainType} grain with ID {GrainId} and storage key {Key}.",
-                    grainType,
-                    grainId,
-                    key);
+                LogErrorReadStateFailed(exception, grainType, grainId, key);
                 throw new RedisStorageException(Invariant($"Failed to read grain state for {grainType} with ID {grainId} and storage key {key}. {exception.GetType()}: {exception.Message}"));
             }
         }
@@ -181,14 +162,9 @@ namespace Orleans.Persistence
             }
             catch (Exception exception) when (exception is not InconsistentStateException)
             {
-                _logger.LogError(
-                    "Failed to write grain state for {GrainType} grain with ID {GrainId} and storage key {Key}.",
-                    grainType,
-                    grainId,
-                    key);
+                LogErrorWriteStateFailed(exception, grainType, grainId, key);
                 throw new RedisStorageException(
                     Invariant($"Failed to write grain state for {grainType} grain with ID {grainId} and storage key {key}. {exception.GetType()}: {exception.Message}"));
-
             }
         }
 
@@ -266,6 +242,7 @@ namespace Orleans.Persistence
                 }
 
                 grainState.ETag = newETag;
+                grainState.State = CreateInstance<T>();
                 grainState.RecordExists = false;
             }
             catch (Exception exception) when (exception is not InconsistentStateException)
@@ -281,5 +258,37 @@ namespace Orleans.Persistence
             await _connection.CloseAsync().ConfigureAwait(false);
             _connection.Dispose();
         }
+
+        private T CreateInstance<T>() => _activatorProvider.GetActivator<T>().Create();
+
+        [LoggerMessage(
+            Level = LogLevel.Debug,
+            Message = "RedisGrainStorage {Name} is initializing: ServiceId={ServiceId} DeleteOnClear={DeleteOnClear}"
+        )]
+        private partial void LogDebugInitializing(string name, string serviceId, bool deleteOnClear);
+
+        [LoggerMessage(
+            Level = LogLevel.Debug,
+            Message = "Init: Name={Name} ServiceId={ServiceId}, initialized in {ElapsedMilliseconds} ms"
+        )]
+        private partial void LogDebugInitialized(string name, string serviceId, double elapsedMilliseconds);
+
+        [LoggerMessage(
+            Level = LogLevel.Error,
+            Message = "Init: Name={Name} ServiceId={ServiceId}, errored in {ElapsedMilliseconds} ms."
+        )]
+        private partial void LogErrorInitFailed(Exception exception, string name, string serviceId, double elapsedMilliseconds);
+
+        [LoggerMessage(
+            Level = LogLevel.Error,
+            Message = "Failed to read grain state for {GrainType} grain with ID {GrainId} and storage key {Key}."
+        )]
+        private partial void LogErrorReadStateFailed(Exception exception, string grainType, GrainId grainId, RedisKey key);
+
+        [LoggerMessage(
+            Level = LogLevel.Error,
+            Message = "Failed to write grain state for {GrainType} grain with ID {GrainId} and storage key {Key}."
+        )]
+        private partial void LogErrorWriteStateFailed(Exception exception, string grainType, GrainId grainId, RedisKey key);
     }
 }

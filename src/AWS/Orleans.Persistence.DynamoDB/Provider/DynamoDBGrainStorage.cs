@@ -21,7 +21,7 @@ namespace Orleans.Storage
     /// Dynamo DB storage Provider.
     /// Persist Grain State in a DynamoDB table either in Json or Binary format.
     /// </summary>
-    public class DynamoDBGrainStorage : IGrainStorage, ILifecycleParticipant<ISiloLifecycle>
+    public partial class DynamoDBGrainStorage : IGrainStorage, ILifecycleParticipant<ISiloLifecycle>
     {
         private const int MAX_DATA_SIZE = 400 * 1024;
         private const string GRAIN_REFERENCE_PROPERTY_NAME = "GrainReference";
@@ -32,9 +32,8 @@ namespace Orleans.Storage
         private const string CURRENT_ETAG_ALIAS = ":currentETag";
 
         private readonly DynamoDBStorageOptions options;
+        private readonly IActivatorProvider _activatorProvider;
         private readonly ILogger logger;
-        private readonly IServiceProvider serviceProvider;
-        private readonly IActivatorProvider activatorProvider;
         private readonly string name;
 
         private DynamoDBStorage storage;
@@ -45,14 +44,13 @@ namespace Orleans.Storage
         public DynamoDBGrainStorage(
             string name,
             DynamoDBStorageOptions options,
-            IServiceProvider serviceProvider,
+            IActivatorProvider activatorProvider,
             ILogger<DynamoDBGrainStorage> logger)
         {
             this.name = name;
             this.logger = logger;
             this.options = options;
-            this.serviceProvider = serviceProvider;
-            this.activatorProvider = this.serviceProvider.GetRequiredService<IActivatorProvider>();
+            _activatorProvider = activatorProvider;
         }
 
         public void Participate(ISiloLifecycle lifecycle)
@@ -70,7 +68,7 @@ namespace Orleans.Storage
                 var initMsg = string.Format("Init: Name={0} ServiceId={1} Table={2} DeleteStateOnClear={3}",
                         this.name, this.options.ServiceId, this.options.TableName, this.options.DeleteStateOnClear);
 
-                this.logger.LogInformation((int)ErrorCode.StorageProviderBase, $"AWS DynamoDB Grain Storage {this.name} is initializing: {initMsg}");
+                LogInformationInitializingDynamoDBGrainStorage(logger, this.name, initMsg);
 
                 this.storage = new DynamoDBStorage(
                     this.logger,
@@ -99,13 +97,12 @@ namespace Orleans.Storage
                     secondaryIndexes: null,
                     ttlAttributeName: this.options.TimeToLive.HasValue ? GRAIN_TTL_PROPERTY_NAME : null);
                 stopWatch.Stop();
-                this.logger.LogInformation((int)ErrorCode.StorageProviderBase,
-                    $"Initializing provider {this.name} of type {this.GetType().Name} in stage {this.options.InitStage} took {stopWatch.ElapsedMilliseconds} Milliseconds.");
+                LogInformationProviderInitialized(logger, this.name, this.GetType().Name, this.options.InitStage, stopWatch.ElapsedMilliseconds);
             }
             catch (Exception exc)
             {
                 stopWatch.Stop();
-                this.logger.LogError((int)ErrorCode.Provider_ErrorFromInit, $"Initialization failed for provider {this.name} of type {this.GetType().Name} in stage {this.options.InitStage} in {stopWatch.ElapsedMilliseconds} Milliseconds.", exc);
+                LogErrorProviderInitFailed(logger, this.name, this.GetType().Name, this.options.InitStage, stopWatch.ElapsedMilliseconds, exc);
                 throw;
             }
         }
@@ -120,14 +117,7 @@ namespace Orleans.Storage
             if (this.storage == null) throw new ArgumentException("GrainState-Table property not initialized");
 
             string partitionKey = GetKeyString(grainId);
-            if (this.logger.IsEnabled(LogLevel.Trace))
-                this.logger.LogTrace(
-                    (int)ErrorCode.StorageProviderBase,
-                    "Reading: GrainType={GrainType} Pk={PartitionKey} GrainId={GrainId} from Table={TableName}",
-                    grainType,
-                    partitionKey,
-                    grainId,
-                    this.options.TableName);
+            LogTraceReadingGrainState(logger, grainType, partitionKey, grainId, this.options.TableName);
 
             string rowKey = AWSUtils.ValidateDynamoDBRowKey(grainType);
 
@@ -152,17 +142,13 @@ namespace Orleans.Storage
             {
                 var loadedState = ConvertFromStorageFormat<T>(record);
                 grainState.RecordExists = loadedState != null;
-                grainState.State = loadedState ?? Activator.CreateInstance<T>();
+                grainState.State = loadedState ?? CreateInstance<T>();
                 grainState.ETag = record.ETag.ToString();
             }
             else
             {
-                grainState.RecordExists = false;
-                grainState.ETag = null;
-                grainState.State = this.activatorProvider.GetActivator<T>().Create();
+                ResetGrainState(grainState);
             }
-
-            // Else leave grainState in previous default condition
         }
 
         /// <summary> Write state data function for this storage provider. </summary>
@@ -187,14 +173,7 @@ namespace Orleans.Storage
             }
             catch (Exception exc)
             {
-                this.logger.LogError(
-                    (int)ErrorCode.StorageProviderBase,
-                    exc,
-                    "Error Writing: GrainType={GrainType} Grainid={GrainId} ETag={ETag} to Table={TableName}",
-                    grainType,
-                    grainId,
-                    grainState.ETag,
-                    this.options.TableName);
+                LogErrorWritingGrainState(logger, exc, grainType, grainId, grainState.ETag, this.options.TableName);
                 throw;
             }
         }
@@ -272,18 +251,8 @@ namespace Orleans.Storage
             if (this.storage == null) throw new ArgumentException("GrainState-Table property not initialized");
 
             string partitionKey = GetKeyString(grainId);
-            if (this.logger.IsEnabled(LogLevel.Trace))
-            {
-                this.logger.LogTrace(
-                    (int)ErrorCode.StorageProviderBase,
-                    "Clearing: GrainType={GrainType} Pk={PartitionKey} GrainId={GrainId} ETag={ETag} DeleteStateOnClear={DeleteStateOnClear} from Table={TableName}",
-                    grainType,
-                    partitionKey,
-                    grainId,
-                    grainState.ETag,
-                    this.options.DeleteStateOnClear,
-                    this.options.TableName);
-            }
+            LogTraceClearingGrainState(logger, grainType, partitionKey, grainId, grainState.ETag, this.options.DeleteStateOnClear, this.options.TableName);
+
             string rowKey = AWSUtils.ValidateDynamoDBRowKey(grainType);
             var record = new GrainStateRecord { GrainReference = partitionKey, ETag = string.IsNullOrWhiteSpace(grainState.ETag) ? 0 : int.Parse(grainState.ETag), GrainType = rowKey };
 
@@ -298,25 +267,18 @@ namespace Orleans.Storage
                     keys.Add(GRAIN_TYPE_PROPERTY_NAME, new AttributeValue(record.GrainType));
 
                     await this.storage.DeleteEntryAsync(this.options.TableName, keys).ConfigureAwait(false);
-                    grainState.ETag = null;
+                    ResetGrainState(grainState);
                 }
                 else
                 {
                     await WriteStateInternal(grainState, record, true);
-                    grainState.State = this.activatorProvider.GetActivator<T>().Create();
+                    grainState.State = CreateInstance<T>();
+                    grainState.RecordExists = false;
                 }
             }
             catch (Exception exc)
             {
-                this.logger.LogError(
-                    (int)ErrorCode.StorageProviderBase,
-                    exc,
-                    "Error {Operation}: GrainType={GrainType} GrainId={GrainId} ETag={ETag} from Table={TableName}",
-                    operation,
-                    grainType,
-                    grainId,
-                    grainState.ETag,
-                    this.options.TableName);
+                LogErrorClearingGrainState(logger, exc, operation, grainType, grainId, grainState.ETag, this.options.TableName);
                 throw;
             }
         }
@@ -354,7 +316,7 @@ namespace Orleans.Storage
                 }
 
                 var message = sb.ToString();
-                this.logger.LogError(exc, "{Message}", message);
+                LogError(logger, message);
                 throw new AggregateException(message, exc);
             }
 
@@ -368,8 +330,7 @@ namespace Orleans.Storage
             entity.State = this.options.GrainStorageSerializer.Serialize(grainState).ToArray();
             dataSize = BINARY_STATE_PROPERTY_NAME.Length + entity.State.Length;
 
-            if (this.logger.IsEnabled(LogLevel.Trace)) this.logger.LogTrace("Writing binary data size = {DataSize} for grain id = Partition={Partition} / Row={Row}",
-                dataSize, entity.GrainReference, entity.GrainType);
+            LogTraceWritingBinaryData(logger, dataSize, entity.GrainReference, entity.GrainType);
 
             var pkSize = GRAIN_REFERENCE_PROPERTY_NAME.Length + entity.GrainReference.Length;
             var rkSize = GRAIN_TYPE_PROPERTY_NAME.Length + entity.GrainType.Length;
@@ -381,6 +342,70 @@ namespace Orleans.Storage
                 throw new ArgumentOutOfRangeException("GrainState.Size", msg);
             }
         }
+
+        private void ResetGrainState<T>(IGrainState<T> grainState)
+        {
+            grainState.RecordExists = false;
+            grainState.ETag = null;
+            grainState.State = CreateInstance<T>();
+        }
+
+        private T CreateInstance<T>() => _activatorProvider.GetActivator<T>().Create();
+
+        [LoggerMessage(
+            Level = LogLevel.Information,
+            Message = "AWS DynamoDB Grain Storage {Name} is initializing: {InitMsg}"
+        )]
+        private static partial void LogInformationInitializingDynamoDBGrainStorage(ILogger logger, string name, string initMsg);
+
+        [LoggerMessage(
+            Level = LogLevel.Information,
+            Message = "Initializing provider {Name} of type {Type} in stage {Stage} took {ElapsedMilliseconds} Milliseconds."
+        )]
+        private static partial void LogInformationProviderInitialized(ILogger logger, string name, string type, int stage, long elapsedMilliseconds);
+
+        [LoggerMessage(
+            EventId = (int)ErrorCode.Provider_ErrorFromInit,
+            Level = LogLevel.Error,
+            Message = "Initialization failed for provider {Name} of type {Type} in stage {Stage} in {ElapsedMilliseconds} Milliseconds."
+        )]
+        private static partial void LogErrorProviderInitFailed(ILogger logger, string name, string type, int stage, long elapsedMilliseconds, Exception exception);
+
+        [LoggerMessage(
+            Level = LogLevel.Trace,
+            Message = "Reading: GrainType={GrainType} Pk={PartitionKey} GrainId={GrainId} from Table={TableName}"
+        )]
+        private static partial void LogTraceReadingGrainState(ILogger logger, string grainType, string partitionKey, GrainId grainId, string tableName);
+
+        [LoggerMessage(
+            Level = LogLevel.Error,
+            Message = "Error Writing: GrainType={GrainType} GrainId={GrainId} ETag={ETag} to Table={TableName}"
+        )]
+        private static partial void LogErrorWritingGrainState(ILogger logger, Exception exception, string grainType, GrainId grainId, string eTag, string tableName);
+
+        [LoggerMessage(
+            Level = LogLevel.Trace,
+            Message = "Clearing: GrainType={GrainType} Pk={PartitionKey} GrainId={GrainId} ETag={ETag} DeleteStateOnClear={DeleteStateOnClear} from Table={TableName}"
+        )]
+        private static partial void LogTraceClearingGrainState(ILogger logger, string grainType, string partitionKey, GrainId grainId, string eTag, bool deleteStateOnClear, string tableName);
+
+        [LoggerMessage(
+            Level = LogLevel.Error,
+            Message = "Error {Operation}: GrainType={GrainType} GrainId={GrainId} ETag={ETag} from Table={TableName}"
+        )]
+        private static partial void LogErrorClearingGrainState(ILogger logger, Exception exception, string operation, string grainType, GrainId grainId, string eTag, string tableName);
+
+        [LoggerMessage(
+            Level = LogLevel.Error,
+            Message = "{Message}"
+        )]
+        private static partial void LogError(ILogger logger, string message);
+
+        [LoggerMessage(
+            Level = LogLevel.Trace,
+            Message = "Writing binary data size = {DataSize} for grain id = Partition={Partition} / Row={Row}"
+        )]
+        private static partial void LogTraceWritingBinaryData(ILogger logger, int dataSize, string partition, string row);
     }
 
     public static class DynamoDBGrainStorageFactory
